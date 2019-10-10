@@ -1,0 +1,376 @@
+#!/usr/bin/env python
+#-*- coding: utf-8 -*-
+#
+import sys
+import requests
+from requests.auth import HTTPBasicAuth
+import click
+import re
+from pyconfigstore import ConfigStore
+# not sure if used
+from StringIO import StringIO
+import urllib
+
+VERSION='0.2'
+
+requests.packages.urllib3.disable_warnings()
+
+# Note that version is intentionally left out
+conf = ConfigStore("wjwg", {
+    'ssl_verify': 'yes',
+    'jira': {
+        'url': None,
+        'account': None
+    },
+    'gitlab': {
+        'url': None,
+        'project': None,
+        'token': None,
+        'branch': 'master',
+    },
+    'cache': {
+        'gitlab': {
+            'projects': {}
+        }
+    }
+})
+
+def jiraReq(method, path, data=None):
+    jiraConf = conf.get('jira')
+    url = jiraConf['url']
+    account = jiraConf['account']
+    userAgent = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_9_2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/33.0.1750.152 Safari/537.36'
+
+    return requests.request(
+        method.upper(),
+        url.strip('/') + '/rest/api/latest/search',
+        params=data,
+        auth=HTTPBasicAuth(*account),
+        verify=False,
+        headers={'Content-Type': 'application/json', 'User-Agent': userAgent},
+    )
+
+#TODO: fetch all conf values in one go
+def gitlabReq(method, path, data=None):
+    return requests.request(
+        method.upper(),
+        getNestedConfigValue('gitlab.url').strip('/') + '/' + path,
+        headers={'PRIVATE-TOKEN': getNestedConfigValue('gitlab.token')},
+        verify=False,
+        data=data
+    )
+
+def searchJiraIssues(assigned=False, project=None, sprint=False):
+    params = {'fields': 'summary,project,status'}
+
+    jql = []
+    if True: # Add a flag (--inc-closed) that includes closed
+        jql.append('status != closed')
+    if assigned:
+        jql.append('assignee=currentuser()')
+    if sprint:
+        jql.append('sprint in opensprints()')
+    if project:
+        jql.append('project = {}'.format(project))
+
+    params['jql'] = ' and '.join(jql)
+    params['jql'] += ' ORDER BY status'
+    response = jiraReq('get', '/search', params)
+    return response.json()
+
+def packageGitlabIssueFromJiraData(data):
+    issue = {}
+    issue['title'] = data['fields']['summary'] + '(%s)' % data['key']
+    issue['description'] = None
+    issue['due_date'] = data['fields']['duedate']
+    if data['fields']['description'] != None:
+        issue['description'] = '```\n' + data['fields']['description'] + '\n```'
+    return issue
+
+#TODO: GitLab uses paging if theres more than 100 projects. Need to support that?
+def gitlabFetchProjects(forceUpdate=False):
+    projects = []
+    cache = getNestedConfigValue('cache.gitlab.projects')
+    if not cache:
+        cache = {}
+    elif not forceUpdate:
+        for name, data in cache.items():
+            projects.append({
+                'id': data['id'],
+                'name': name,
+                'branch': data['branch'],
+                'url': data['url']
+            })
+        return projects
+
+    res = gitlabReq('get', 'api/v4/projects?simple=true&per_page=100')
+    for data in res.json():
+        # not writing over existing data, maybe we should?
+        if not data['path_with_namespace'] in cache:
+            cache[data['path_with_namespace']] = {
+                'id': data['id'],
+                'branch': data['default_branch'],
+                'url': data['web_url']
+            }
+
+        projects.append({
+            'id': data['id'],
+            'name': data['path_with_namespace'],
+            'branch': data['default_branch'],
+            'url': data['web_url'],
+        })
+    setNestedConfigValue('cache.gitlab.projects', cache)
+    return projects
+
+def createGitlabIssueFromJiraData(data):
+    payload = packageGitlabIssueFromJiraData(data)
+    gitlab_project_id = findProjectId(getNestedConfigValue('gitlab.project'))
+
+    response = gitlabReq(
+            'post',
+            'api/v4/projects/%s/issues' % gitlab_project_id,
+            payload
+    ).json()
+    return response
+
+def assignGitlabIssue(issueId, userId):
+    gitlab_project_id = findProjectId(getNestedConfigValue('gitlab.project'))
+    response = gitlabReq(
+        'put',
+        'api/v4/projects/%s/issues/%s' % (gitlab_project_id, issueId),
+        {
+            'assignee_id': userId
+        }
+    ).json()
+    return response
+
+#TODO: rename to getProjectId?
+def findProjectId(projectname):
+    cache = getNestedConfigValue('cache.gitlab.projects')
+    if projectname in cache:
+        return cache[projectname]['id']
+
+    projects = gitlabFetchProjects(forceUpdate=True)
+    for project in projects:
+        if projectname == project['name']:
+            return project['id']
+
+    raise Exception("Unable to find %s in gitlab!" % projectname)
+
+def fetchJiraIssue(jiraIssueId):
+    res = jiraReq('get', 'rest/api/latest/issue/%s' % jiraIssueId)
+    if res.status_code != requests.codes.ok:
+        return None
+    return res.json()
+
+def importJiraIssue(jiraIssueId):
+    data = fetchJiraIssue(jiraIssueId)
+    if data == None:
+        #TODO replace with proper exception
+        sys.exit('Something went wrong while fetching the issue')
+    return createGitlabIssueFromJiraData(data)
+
+def validate_jira_id(ctx, param, value):
+    if not re.match(r"^[A-Z]+-\d+$", value):
+        raise click.BadParameter('jiraid must be in the format [ABC-123]')
+    return value
+
+def createMergeRequest(issue):
+    branch = '{id}-{title}'.format(
+        id = issue['iid'],
+        title = re.sub('[^a-zA-Z0-9-]+', '-', issue['title']).strip('-')
+    )
+
+    gitlab_project_id = findProjectId(getNestedConfigValue('gitlab.project'))
+
+    # create branch
+    response = gitlabReq(
+        'post',
+        'api/v4/projects/%s/repository/branches' % gitlab_project_id,
+        {
+            'ref': getNestedConfigValue('gitlab.branch'),
+            'branch': branch
+        }
+    )
+
+    # create MR
+    response = gitlabReq(
+        'post',
+        'api/v4/projects/%s/merge_requests' % gitlab_project_id,
+        {
+            'source_branch': branch,
+            'target_branch': getNestedConfigValue('gitlab.branch'),
+            'title': 'WIP: Resolve "%s"' % issue['title'],
+            'description': 'Closes #%s' % issue['iid']
+        }
+    ).json()
+    return response
+
+def haveConfiguration():
+    if not conf.has('version'):
+        click.echo('You need to configure wjwg first')
+        click.echo('Usage: wjwg configure')
+        raise click.Abort()
+
+# Doesn't seem like my version of pyconfigstore supports getting nested values
+def getNestedConfigValue(key):
+    parts = key.split('.')
+    if len(parts) == 1:
+        return conf.get(key)
+
+    value = None
+    for part in parts:
+        if not value:
+            if not conf.has(part):
+                return None # raise exception instead
+            value = conf.get(part)
+        else:
+            value = value[part]
+
+    return value
+
+# Doesn't seem like my version of pyconfigstore supports updating nested values
+def setNestedConfigValue(key, value):
+    parts = key.split('.')
+    rootKey = parts[0]
+    if not conf.has(rootKey):
+        nest = {}
+    else:
+        nest = conf.get(rootKey)
+
+    for subKey in parts[:0:-1]:
+        value = {subKey: value}
+
+    nest = dict(nest, **value)
+    conf.set(rootKey, nest)
+
+@click.group()
+@click.version_option(version='0.1', prog_name='Why use Jira When we have GitLab')
+def main():
+    """
+    A neat little tool to make life with Jira+GitLab a bit easier.
+
+    Tip: add '--help' after a command for more info.
+    """
+    pass
+
+@main.command()
+@click.option('--key', default=None, help='Change value of a specific configuration key')
+def configure(key):
+    """Initial configuration and setup"""
+    click.echo('Configuring wjwg...')
+    click.echo('')
+
+    # TODO: make this a bit more efficient when not using a key.
+    #       calling setNestedConfigValue for each option isn't the best
+
+    if not key or key == 'ssl_verify':
+        if click.confirm(text='Verify SSL certificates?', default=True, show_default=True, abort=False):
+            conf.set('ssl_verify', 'yes')
+        else:
+            conf.set('ssl_verify', 'no')
+
+    if not key or key == 'jira.url':
+        value = click.prompt(text='URL to jira instance i.e. https://jira.host.tld/')
+        setNestedConfigValue('jira.url', value)
+
+    if not key or key == 'jira.account':
+        username = click.prompt(text='Jira account name')
+        password = click.prompt(text='Jira account password', hide_input=True)
+        setNestedConfigValue('jira.account', (username, password))
+
+    if not key or key == 'gitlab.url':
+        value = click.prompt(text='URL to GitLab instance i.e. https://gitlab.host.tld/')
+        setNestedConfigValue('gitlab.url', value)
+
+    if not key or key == 'gitlab.project':
+        value = click.prompt(text='Default GitLab project')
+        setNestedConfigValue('gitlab.project', value)
+
+    if not key or key == 'gitlab.token':
+        value = click.prompt(text='Personal GitLab API token')
+        setNestedConfigValue('gitlab.token', value)
+
+    if not key or key == 'gitlab.branch':
+        value = click.prompt(text='Default branch for MRs')
+        setNestedConfigValue('gitlab.branch', value)
+
+    if not key:
+        conf.set('version', VERSION)
+
+    click.echo('Save ok!')
+
+@main.command()
+def clear():
+    """Clears the local cache"""
+    if not click.confirm(text='Clear cache?', default=False, show_default=True):
+        raise click.Abort()
+
+    if conf.has('cache'):
+        conf.delete('cache')
+    click.echo('Ok!')
+
+@main.command()
+@click.option('--assigned', is_flag=True, default=False, help='only issues assigned to me')
+@click.option('--sprint', is_flag=True, default=False, help='include only issues in active sprint')
+@click.option('--project', default=None, help='limit issues to specified project')
+def issues(assigned, sprint, project):
+    """Will show a list of Jira issues"""
+    data = searchJiraIssues(assigned=assigned, sprint=sprint, project=project)
+    total = data['total']
+#    startAt = data['startAt']
+#    maxResults = data['maxResults']
+    for issue in data['issues']:
+        output = {
+            'id': issue['key'],
+            'project': issue['fields']['project']['key'],
+            'title': issue['fields']['summary'][0:100].encode('utf-8'),
+            'status': issue['fields']['status']['name']
+        }
+        if not project:
+            click.echo('{id:<10} {status:<12} {project:<6} {title}'.format(**output))
+        else:
+            click.echo('{id:<10} {status:<12} {title}'.format(**output))
+
+#TODO: make output prettier
+@main.command()
+@click.option('--force-update', 'forceUpdate', is_flag=True, help='Don\'t use cached data')
+def projects(forceUpdate):
+    """List available GitLab projects"""
+    haveConfiguration()
+    projects = gitlabFetchProjects(forceUpdate)
+    for project in projects:
+        line = '{name:<40} {branch:10} {url}'.format(**project)
+        click.echo(line)
+
+@main.command()
+def test():
+    """Just used for testing stuff"""
+    haveConfiguration()
+    print 'test'
+
+@main.command()
+@click.argument('jiraid', callback=validate_jira_id)
+@click.option('--mr', is_flag=True, default=False, help='also create a merge request for the issue')
+@click.option('--assign', is_flag=True, default=False, help='assign ticket to yourself')
+#@click.option('--project', default=None, help='import to a project other than the configured default')
+#@click.option('--branch', default=None, help='specifies the target branch when used with --mr')
+def issue(mr, assign, jiraid):
+    """imports an issue from Jira to GitLab"""
+    haveConfiguration()
+
+    click.echo('importing issue %s!' % jiraid)
+    gitlabIssue = importJiraIssue(jiraid)
+    click.echo('Created GitLab issue #%s' % gitlabIssue['iid'])
+    click.echo('Location: %s' % gitlabIssue['web_url'])
+
+    # if we are creating an MR we should probably assign as well
+    if assign or mr:
+        assignGitlabIssue(gitlabIssue['iid'], gitlabIssue['author']['id'])
+    if mr:
+        mergeRequest = createMergeRequest(gitlabIssue)
+        click.echo('Created branch %s' % mergeRequest['source_branch'])
+        click.echo('and merge request @ %s' % mergeRequest['web_url'])
+
+if __name__ == '__main__':
+    main()
