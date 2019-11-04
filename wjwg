@@ -43,7 +43,7 @@ def jiraReq(method, path, data=None):
 
     return requests.request(
         method.upper(),
-        url.strip('/') + '/rest/api/latest/search',
+        url.strip('/') + '/' + path,
         params=data,
         auth=HTTPBasicAuth(*account),
         verify=False,
